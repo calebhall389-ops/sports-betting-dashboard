@@ -1,310 +1,570 @@
 'use client';
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
 
-import { useState, useEffect, useCallback, useRef } from 'react';
-import type { ProcessedGame, SportKey, AlertPayload } from '@/types/betting';
-import Header from '@/components/dashboard/Header';
-import SportsTabs from '@/components/dashboard/SportsTabs';
-import MatchupCard from '@/components/dashboard/MatchupCard';
-import StatsBar from '@/components/dashboard/StatsBar';
-import AlertToast, { type ToastMessage } from '@/components/dashboard/AlertToast';
-import { Search, SlidersHorizontal } from 'lucide-react';
+/**
+ * ODDSJAM-STYLE BETTING DASHBOARD
+ *
+ * Added in this version:
+ * - Stronger +EV model from no-vig consensus pricing
+ * - Sharp/public tracking hooks
+ * - Player props scanner
+ * - AI scoring model for sides + props
+ * - Best-bet board, prop board, sportsbook comparison, alerts
+ *
+ * Expected server routes:
+ * - GET  /api/odds?sport=<sportKey>
+ * - GET  /api/player-props?sport=<sportKey>&markets=<comma-separated markets>
+ * - GET  /api/betting-splits?home=<team>&away=<team>&sport=<sportKey>
+ * - GET  /api/sports-news?q=<query>
+ * - POST /api/send-best-bet-alert
+ */
 
-const REFRESH_INTERVAL = 60;
+const SPORTS = [
+  { key: "baseball_mlb", label: "MLB", propMarkets: ["batter_home_runs", "pitcher_strikeouts", "batter_hits"] },
+  { key: "basketball_nba", label: "NBA", propMarkets: ["player_points", "player_rebounds", "player_assists"] },
+  { key: "americanfootball_nfl", label: "NFL", propMarkets: ["player_pass_yds", "player_rush_yds", "player_receptions"] },
+  { key: "icehockey_nhl", label: "NHL", propMarkets: ["player_goals", "player_points", "player_shots_on_goal"] },
+  { key: "mma_mixed_martial_arts", label: "MMA", propMarkets: ["fight_winner"] },
+];
 
-type SortOption = 'ev' | 'time' | 'recommendation';
+const REFRESH_MS = 60_000;
+const ALERT_THRESHOLD_EV = 3;
 
-function EmptyState({ sport, loading }: { sport: SportKey; loading: boolean }) {
-  if (loading) {
-    return (
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {[1, 2, 3, 4].map((i) => (
-          <div key={i} className="h-52 rounded-xl bg-slate-900 border border-slate-800 animate-pulse" />
+const formatOdds = (odds: number | null | undefined) => {
+  if (odds === null || odds === undefined || Number.isNaN(Number(odds))) return "—";
+  const n = Number(odds);
+  return n > 0 ? `+${n}` : `${n}`;
+};
+
+const formatPct = (n: number | null | undefined, digits = 2) => {
+  if (n === null || n === undefined || !Number.isFinite(Number(n))) return "—";
+  return `${Number(n).toFixed(digits)}%`;
+};
+
+const americanToImplied = (odds: number) => {
+  if (!Number.isFinite(Number(odds)) || Number(odds) === 0) return 0;
+  return Number(odds) > 0 ? 100 / (Number(odds) + 100) : Math.abs(Number(odds)) / (Math.abs(Number(odds)) + 100);
+};
+
+const americanProfitOn100 = (odds: number) => {
+  if (!Number.isFinite(Number(odds)) || Number(odds) === 0) return 0;
+  return Number(odds) > 0 ? Number(odds) : (100 / Math.abs(Number(odds))) * 100;
+};
+
+const avg = (arr: number[]) => {
+  if (!arr.length) return 0;
+  return arr.reduce((sum, x) => sum + x, 0) / arr.length;
+};
+
+const bestLine = (prices: { price: number }[]) => {
+  if (!prices.length) return null;
+  return prices.reduce((best, current) => (Number(current.price) > Number(best.price) ? current : best));
+};
+
+const normalizeNoVig = (items: { consensusImplied: number }[]) => {
+  const total = items.reduce((sum, item) => sum + item.consensusImplied, 0);
+  if (!total) return items.map((item) => ({ ...item, fairProbability: 0 }));
+  return items.map((item) => ({ ...item, fairProbability: item.consensusImplied / total }));
+};
+
+const evPercent = (fairProbability: number, bestOddsPrice: number) => {
+  const winProfit = americanProfitOn100(bestOddsPrice);
+  return fairProbability * winProfit - (1 - fairProbability) * 100;
+};
+
+const kellyPercent = (fairProbability: number, bestOddsPrice: number) => {
+  const b = americanProfitOn100(bestOddsPrice) / 100;
+  if (!b) return 0;
+  const q = 1 - fairProbability;
+  const k = (b * fairProbability - q) / b;
+  return Math.max(0, k * 100);
+};
+
+const getSharpSummary = (ticketPct?: number | null, moneyPct?: number | null) => {
+  const tickets = Number(ticketPct ?? 0);
+  const money = Number(moneyPct ?? 0);
+  const diff = money - tickets;
+
+  if (moneyPct == null || ticketPct == null) {
+    return {
+      sharpLabel: "No splits feed",
+      publicLabel: "No public data",
+      sharpScore: 0,
+      note: "Connect a real tickets-vs-money source to sharpen this signal.",
+    };
+  }
+
+  if (diff >= 12) {
+    return {
+      sharpLabel: "Sharp money signal",
+      publicLabel: "Public lighter than money",
+      sharpScore: 2,
+      note: "Money % is well above ticket %.",
+    };
+  }
+
+  if (diff >= 6) {
+    return {
+      sharpLabel: "Moderate sharp signal",
+      publicLabel: "Pros slightly heavier",
+      sharpScore: 1,
+      note: "Money % is modestly above ticket %.",
+    };
+  }
+
+  if (diff <= -12) {
+    return {
+      sharpLabel: "Public-heavy side",
+      publicLabel: "Tickets outweigh money",
+      sharpScore: -2,
+      note: "Ticket % is much higher than money %.",
+    };
+  }
+
+  return {
+    sharpLabel: "Balanced splits",
+    publicLabel: "No strong split edge",
+    sharpScore: 0,
+    note: "Tickets and money are close.",
+  };
+};
+
+const lineMoveScore = (consensusPrice: number, bestPrice: number) => {
+  if (!Number.isFinite(consensusPrice) || !Number.isFinite(bestPrice)) return 0;
+  const delta = Number(bestPrice) - Number(consensusPrice);
+  if (delta >= 20) return 2;
+  if (delta >= 10) return 1;
+  if (delta <= -20) return -2;
+  if (delta <= -10) return -1;
+  return 0;
+};
+
+const confidenceBucket = (score: number) => {
+  if (score >= 7) return "🔥 MAX BET";
+  if (score >= 5) return "💰 STRONG +EV";
+  if (score >= 3) return "✅ LEAN";
+  if (score <= 0) return "❌ FADE";
+  return "⚠️ PASS";
+};
+
+const aiScore = ({ ev, kelly, sharpScore, lineScore, newsBoost = 0, propBoost = 0 }: { ev: number; kelly: number; sharpScore: number; lineScore: number; newsBoost?: number; propBoost?: number }) => {
+  let score = 0;
+  if (ev >= 5) score += 4;
+  else if (ev >= 3) score += 3;
+  else if (ev >= 1.5) score += 2;
+  else if (ev > 0) score += 1;
+  else score -= 2;
+
+  if (kelly >= 5) score += 2;
+  else if (kelly >= 2) score += 1;
+
+  score += sharpScore;
+  score += lineScore;
+  score += newsBoost;
+  score += propBoost;
+
+  return score;
+};
+
+const flattenSidePrices = (game: any) => {
+  const rows: any[] = [];
+  (game.bookmakers || []).forEach((bookmaker: any) => {
+    (bookmaker.markets || []).forEach((market: any) => {
+      if (market.key !== "h2h") return;
+      (market.outcomes || []).forEach((outcome: any) => {
+        rows.push({
+          bookmakerKey: bookmaker.key,
+          bookmakerTitle: bookmaker.title,
+          name: outcome.name,
+          price: Number(outcome.price),
+        });
+      });
+    });
+  });
+  return rows;
+};
+
+const flattenPropMarkets = (events: any[]) => {
+  const props: any[] = [];
+  events.forEach((event: any) => {
+    (event.bookmakers || []).forEach((bookmaker: any) => {
+      (bookmaker.markets || []).forEach((market: any) => {
+        (market.outcomes || []).forEach((outcome: any) => {
+          props.push({
+            eventId: event.id,
+            sportKey: event.sport_key,
+            homeTeam: event.home_team,
+            awayTeam: event.away_team,
+            bookmakerTitle: bookmaker.title,
+            marketKey: market.key,
+            player: outcome.description || outcome.name,
+            sideLabel: outcome.name,
+            line: outcome.point ?? null,
+            price: Number(outcome.price),
+          });
+        });
+      });
+    });
+  });
+  return props;
+};
+
+function SectionTitle({ title, subtitle }: { title: string; subtitle?: string }) {
+  return (
+    <div>
+      <div className="text-lg font-semibold">{title}</div>
+      {subtitle && <div className="text-sm text-slate-500">{subtitle}</div>}
+    </div>
+  );
+}
+
+export default function BettingDashboard() {
+  const [selectedSport, setSelectedSport] = useState(SPORTS[0].key);
+  const [games, setGames] = useState<any[]>([]);
+  const [propsBoard, setPropsBoard] = useState<any[]>([]);
+  const [newsByGame, setNewsByGame] = useState<Record<string, any[]>>({});
+  const [alertLog, setAlertLog] = useState<string[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [lastScan, setLastScan] = useState("");
+
+  const selectedSportMeta = SPORTS.find((s) => s.key === selectedSport) || SPORTS[0];
+
+  const fetchNewsForGame = useCallback(async (gameId: string, homeTeam: string, awayTeam: string) => {
+    try {
+      const q = encodeURIComponent(`${homeTeam} OR ${awayTeam}`);
+      const res = await fetch(`/api/sports-news?q=${q}`);
+      const json = await res.json();
+      setNewsByGame((prev) => ({ ...prev, [gameId]: json.articles || [] }));
+    } catch {
+      setNewsByGame((prev) => ({ ...prev, [gameId]: [] }));
+    }
+  }, []);
+
+  const fetchEverything = useCallback(async () => {
+    setLoading(true);
+    try {
+      const oddsRes = await fetch(`/api/odds?sport=${selectedSport}`);
+      const oddsJson = await oddsRes.json();
+
+      const processedGames = await Promise.all(
+        (oddsJson || []).map(async (game: any) => {
+          const rows = flattenSidePrices(game);
+          const sideNames = [...new Set(rows.map((row) => row.name))];
+
+          const sideBase = sideNames.map((sideName) => {
+            const prices = rows.filter((row) => row.name === sideName);
+            const best = bestLine(prices);
+            const consensusPrice = avg(prices.map((p) => Number(p.price)));
+            return {
+              sideName,
+              allPrices: prices.sort((a, b) => Number(b.price) - Number(a.price)),
+              bestBook: best?.bookmakerTitle || "—",
+              bestPrice: best?.price ?? null,
+              consensusPrice,
+              consensusImplied: americanToImplied(consensusPrice),
+            };
+          });
+
+          const fairSides = normalizeNoVig(sideBase);
+
+          const splitsRes = await fetch(`/api/betting-splits?home=${encodeURIComponent(game.home_team)}&away=${encodeURIComponent(game.away_team)}&sport=${encodeURIComponent(selectedSport)}`);
+          const splitsJson = splitsRes.ok ? await splitsRes.json() : { sides: {} };
+
+          const enrichedSides = fairSides.map((side: any) => {
+            const split = splitsJson?.sides?.[side.sideName] || {};
+            const ev = evPercent(side.fairProbability, Number(side.bestPrice));
+            const kelly = kellyPercent(side.fairProbability, Number(side.bestPrice));
+            const sharp = getSharpSummary(split.ticketPct, split.moneyPct);
+            const lineScore = lineMoveScore(Number(side.consensusPrice), Number(side.bestPrice));
+            const score = aiScore({ ev, kelly, sharpScore: sharp.sharpScore, lineScore });
+            return {
+              ...side,
+              ev,
+              kelly,
+              ticketPct: split.ticketPct ?? null,
+              moneyPct: split.moneyPct ?? null,
+              sharpLabel: sharp.sharpLabel,
+              publicLabel: sharp.publicLabel,
+              note: sharp.note,
+              lineScore,
+              aiScore: score,
+              aiTag: confidenceBucket(score),
+              bestBet: ev >= ALERT_THRESHOLD_EV,
+            };
+          });
+
+          const strongestSide = [...enrichedSides].sort((a, b) => b.ev - a.ev)[0] || null;
+          return {
+            id: `${selectedSport}-${game.id}`,
+            sportKey: selectedSport,
+            homeTeam: game.home_team,
+            awayTeam: game.away_team,
+            commenceTime: game.commence_time,
+            sides: enrichedSides,
+            strongestSide,
+          };
+        })
+      );
+
+      setGames(processedGames);
+      processedGames.slice(0, 6).forEach((game) => fetchNewsForGame(game.id, game.homeTeam, game.awayTeam));
+
+      const propMarkets = selectedSportMeta.propMarkets.join(",");
+      const propsRes = await fetch(`/api/player-props?sport=${selectedSport}&markets=${encodeURIComponent(propMarkets)}`);
+      const propsJson = propsRes.ok ? await propsRes.json() : [];
+      const flatProps = flattenPropMarkets(propsJson || []);
+
+      const grouped = Object.values(
+        flatProps.reduce((acc: Record<string, any>, row: any) => {
+          const key = `${row.eventId}-${row.marketKey}-${row.player}-${row.sideLabel}-${row.line ?? "na"}`;
+          if (!acc[key]) {
+            acc[key] = {
+              ...row,
+              allPrices: [],
+            };
+          }
+          acc[key].allPrices.push({ bookmakerTitle: row.bookmakerTitle, price: row.price });
+          return acc;
+        }, {})
+      ).map((item: any) => {
+        const prices = item.allPrices || [];
+        const best = bestLine(prices);
+        const consensusPrice = avg(prices.map((p: any) => Number(p.price)));
+        const fairProbability = americanToImplied(consensusPrice);
+        const ev = evPercent(fairProbability, Number(best?.price));
+        const kelly = kellyPercent(fairProbability, Number(best?.price));
+        const score = aiScore({ ev, kelly, sharpScore: 0, lineScore: lineMoveScore(consensusPrice, Number(best?.price)), propBoost: 1 });
+        return {
+          ...item,
+          bestBook: best?.bookmakerTitle || "—",
+          bestPrice: best?.price ?? null,
+          consensusPrice,
+          fairProbability,
+          ev,
+          kelly,
+          aiScore: score,
+          aiTag: confidenceBucket(score),
+          bestBet: ev >= ALERT_THRESHOLD_EV,
+        };
+      }).sort((a: any, b: any) => b.ev - a.ev);
+
+      setPropsBoard(grouped.slice(0, 40));
+      setLastScan(new Date().toLocaleTimeString());
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setLoading(false);
+    }
+  }, [fetchNewsForGame, selectedSport, selectedSportMeta.propMarkets]);
+
+  useEffect(() => {
+    fetchEverything();
+    const interval = setInterval(fetchEverything, REFRESH_MS);
+    return () => clearInterval(interval);
+  }, [fetchEverything]);
+
+  const topSides = useMemo(() => {
+    return games
+      .map((g) => ({ game: g, side: g.strongestSide }))
+      .filter((entry) => entry.side)
+      .sort((a, b) => b.side.ev - a.side.ev)
+      .slice(0, 10);
+  }, [games]);
+
+  const topProps = useMemo(() => propsBoard.filter((p) => p.bestBet).slice(0, 10), [propsBoard]);
+
+  const sendAlert = useCallback(async (label: string, payload: any) => {
+    try {
+      await fetch("/api/send-best-bet-alert", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label, ...payload }),
+      });
+      setAlertLog((prev) => [`${new Date().toLocaleTimeString()} • ${label}`, ...prev].slice(0, 8));
+    } catch {
+      setAlertLog((prev) => [`${new Date().toLocaleTimeString()} • alert failed`, ...prev].slice(0, 8));
+    }
+  }, []);
+
+  useEffect(() => {
+    topSides.slice(0, 2).forEach(({ game, side }) => {
+      const key = `side-${game.id}-${side.sideName}-${Math.round(side.ev * 10)}`;
+      if (!alertLog.some((x) => x.includes(key))) {
+        sendAlert(key, {
+          matchup: `${game.awayTeam} @ ${game.homeTeam}`,
+          pick: side.sideName,
+          book: side.bestBook,
+          odds: side.bestPrice,
+          evPercent: side.ev,
+          aiTag: side.aiTag,
+        });
+      }
+    });
+
+    topProps.slice(0, 2).forEach((prop) => {
+      const key = `prop-${prop.eventId}-${prop.player}-${prop.marketKey}-${Math.round(prop.ev * 10)}`;
+      if (!alertLog.some((x) => x.includes(key))) {
+        sendAlert(key, {
+          matchup: `${prop.awayTeam} @ ${prop.homeTeam}`,
+          pick: `${prop.player} ${prop.sideLabel} ${prop.line ?? ""}`,
+          book: prop.bestBook,
+          odds: prop.bestPrice,
+          evPercent: prop.ev,
+          aiTag: prop.aiTag,
+        });
+      }
+    });
+  }, [topSides, topProps, alertLog, sendAlert]);
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-white p-6 grid gap-6">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <h1 className="text-3xl font-bold">EdgeFinder Pro</h1>
+          <p className="text-sm text-slate-400">Odds scanner, +EV engine, sharp/public signals, player props, and AI recommendations.</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {SPORTS.map((sport) => (
+            <Button key={sport.key} variant={selectedSport === sport.key ? "default" : "outline"} onClick={() => setSelectedSport(sport.key)}>
+              {sport.label}
+            </Button>
+          ))}
+          <Button onClick={fetchEverything}>{loading ? "Scanning..." : "Refresh"}</Button>
+        </div>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-4">
+        <Card className="rounded-2xl bg-slate-900 border-slate-800"><CardContent className="p-4"><div className="text-sm text-slate-400">Last scan</div><div className="text-xl font-semibold">{lastScan || "—"}</div></CardContent></Card>
+        <Card className="rounded-2xl bg-slate-900 border-slate-800"><CardContent className="p-4"><div className="text-sm text-slate-400">Top side bets</div><div className="text-xl font-semibold">{topSides.length}</div></CardContent></Card>
+        <Card className="rounded-2xl bg-slate-900 border-slate-800"><CardContent className="p-4"><div className="text-sm text-slate-400">Top prop bets</div><div className="text-xl font-semibold">{topProps.length}</div></CardContent></Card>
+        <Card className="rounded-2xl bg-slate-900 border-slate-800"><CardContent className="p-4"><div className="text-sm text-slate-400">Alert threshold</div><div className="text-xl font-semibold">{ALERT_THRESHOLD_EV.toFixed(1)}% EV</div></CardContent></Card>
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-2">
+        <Card className="rounded-2xl bg-slate-900 border-slate-800">
+          <CardContent className="p-4 grid gap-3">
+            <SectionTitle title="Top +EV Side Bets" subtitle="Closest thing to an OddsJam-style best-bet board." />
+            {topSides.length === 0 && <div className="text-sm text-slate-400">No side bets over your current threshold.</div>}
+            {topSides.map(({ game, side }) => (
+              <div key={`${game.id}-${side.sideName}`} className="rounded-xl border border-slate-800 p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="font-semibold">{game.awayTeam} @ {game.homeTeam}</div>
+                    <div className="text-sm text-slate-400">Bet {side.sideName} at {side.bestBook} {formatOdds(side.bestPrice)}</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="font-bold">{formatPct(side.ev)}</div>
+                    <div className="text-xs text-slate-400">{side.aiTag}</div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+
+        <Card className="rounded-2xl bg-slate-900 border-slate-800">
+          <CardContent className="p-4 grid gap-3">
+            <SectionTitle title="Top +EV Player Props" subtitle="Best prop spots across books and markets." />
+            {topProps.length === 0 && <div className="text-sm text-slate-400">No props over your current threshold.</div>}
+            {topProps.map((prop) => (
+              <div key={`${prop.eventId}-${prop.marketKey}-${prop.player}-${prop.line}`} className="rounded-xl border border-slate-800 p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="font-semibold">{prop.player}</div>
+                    <div className="text-sm text-slate-400">{prop.marketKey} • {prop.sideLabel} {prop.line ?? ""}</div>
+                    <div className="text-sm text-slate-400">{prop.bestBook} {formatOdds(prop.bestPrice)}</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="font-bold">{formatPct(prop.ev)}</div>
+                    <div className="text-xs text-slate-400">{prop.aiTag}</div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid gap-6">
+        {games.map((game) => (
+          <Card key={game.id} className="rounded-2xl bg-slate-900 border-slate-800">
+            <CardContent className="p-4 grid gap-4">
+              <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+                <div>
+                  <div className="text-lg font-bold">{game.awayTeam} @ {game.homeTeam}</div>
+                  <div className="text-sm text-slate-400">Starts: {new Date(game.commenceTime).toLocaleString()}</div>
+                </div>
+                <div className="text-sm text-slate-400">Strongest angle: {game.strongestSide?.sideName || "—"}</div>
+              </div>
+
+              <div className="grid gap-4 lg:grid-cols-2">
+                {game.sides.map((side: any) => (
+                  <div key={side.sideName} className="rounded-xl border border-slate-800 p-4 grid gap-3">
+                    <div className="flex justify-between gap-3">
+                      <div>
+                        <div className="font-semibold">{side.sideName}</div>
+                        <div className="text-sm text-slate-400">Best line: {side.bestBook} {formatOdds(side.bestPrice)}</div>
+                        <div className="text-xs text-slate-500">Consensus: {formatOdds(side.consensusPrice)}</div>
+                      </div>
+                      <div className="text-right">
+                        <div className="font-bold">{formatPct(side.ev)}</div>
+                        <div className="text-xs text-slate-400">EV</div>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-3 text-sm">
+                      <div className="rounded-lg bg-slate-800 p-2"><div className="text-slate-400">Fair %</div><div className="font-semibold">{formatPct(side.fairProbability * 100)}</div></div>
+                      <div className="rounded-lg bg-slate-800 p-2"><div className="text-slate-400">Kelly</div><div className="font-semibold">{formatPct(side.kelly)}</div></div>
+                      <div className="rounded-lg bg-slate-800 p-2"><div className="text-slate-400">AI</div><div className="font-semibold">{side.aiTag}</div></div>
+                    </div>
+
+                    <div className="rounded-lg bg-slate-800 p-3 text-sm">
+                      <div className="font-medium">{side.sharpLabel}</div>
+                      <div className="text-slate-400">{side.publicLabel}</div>
+                      <div className="text-xs text-slate-500 mt-1">{side.note}</div>
+                      <div className="mt-2 text-xs text-slate-400">Tickets: {formatPct(side.ticketPct, 0)} • Money: {formatPct(side.moneyPct, 0)}</div>
+                    </div>
+
+                    <div>
+                      <div className="mb-2 text-sm font-medium">Sportsbook prices</div>
+                      <div className="max-h-44 overflow-auto rounded-lg border border-slate-800">
+                        {side.allPrices.map((row: any, i: number) => (
+                          <div key={`${row.bookmakerKey}-${i}`} className="flex items-center justify-between border-b border-slate-800 px-3 py-2 text-sm last:border-b-0">
+                            <div>{row.bookmakerTitle}</div>
+                            <div className="font-medium">{formatOdds(row.price)}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="grid gap-2 rounded-xl border border-slate-800 p-4">
+                <SectionTitle title="Recent sports news" subtitle="Useful context before locking in a bet." />
+                {(newsByGame[game.id] || []).length === 0 && <div className="text-sm text-slate-400">No articles loaded yet.</div>}
+                {(newsByGame[game.id] || []).slice(0, 5).map((article, idx) => (
+                  <a key={`${game.id}-${idx}`} href={article.url} target="_blank" rel="noreferrer" className="rounded-lg border border-slate-800 p-3 hover:bg-slate-800/60">
+                    <div className="font-medium">{article.title}</div>
+                    <div className="text-xs text-slate-500">{article.source?.name || "Source"} • {article.publishedAt ? new Date(article.publishedAt).toLocaleString() : ""}</div>
+                  </a>
+                ))}
+              </div>
+            </CardContent>
+          </Card>
         ))}
       </div>
-    );
-  }
 
-  return (
-    <div className="text-center py-20">
-      <div className="w-16 h-16 rounded-full bg-slate-800 flex items-center justify-center mx-auto mb-4">
-        <span className="text-3xl">
-          {sport === 'baseball_mlb' ? '⚾' :
-           sport === 'basketball_nba' ? '🏀' :
-           sport === 'americanfootball_nfl' ? '🏈' :
-           sport === 'icehockey_nhl' ? '🏒' : '🥊'}
-        </span>
-      </div>
-      <h3 className="text-slate-300 font-semibold mb-2">No games found</h3>
-      <p className="text-slate-500 text-sm max-w-sm mx-auto">
-        No upcoming games are available for this sport right now. Check back later or try another sport.
-      </p>
+      <Card className="rounded-2xl bg-slate-900 border-slate-800">
+        <CardContent className="p-4 grid gap-3">
+          <SectionTitle title="Recent alerts" subtitle="Texts sent when a side or prop crosses your threshold." />
+          {alertLog.length === 0 && <div className="text-sm text-slate-400">No alerts yet.</div>}
+          {alertLog.map((line, i) => <div key={i} className="text-sm text-slate-300">{line}</div>)}
+        </CardContent>
+      </Card>
     </div>
   );
 }
 
-export default function Dashboard() {
-  const [activeSport, setActiveSport] = useState<SportKey>('baseball_mlb');
-  const [gamesCache, setGamesCache] = useState<Partial<Record<SportKey, ProcessedGame[]>>>({});
-  const [remainingRequests, setRemainingRequests] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [nextRefresh, setNextRefresh] = useState(REFRESH_INTERVAL);
-  const [toasts, setToasts] = useState<ToastMessage[]>([]);
-  const [sortBy, setSortBy] = useState<SortOption>('ev');
-  const [search, setSearch] = useState('');
-  const [showHighEVOnly, setShowHighEVOnly] = useState(false);
-  const [alertSent, setAlertSent] = useState<Set<string>>(new Set());
-
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
-  const countdownRef = useRef<NodeJS.Timeout | null>(null);
-
-  const addToast = useCallback((toast: Omit<ToastMessage, 'id'>) => {
-    const id = Math.random().toString(36).slice(2);
-    setToasts((prev) => [...prev, { ...toast, id }]);
-  }, []);
-
-  const dismissToast = useCallback((id: string) => {
-    setToasts((prev) => prev.filter((t) => t.id !== id));
-  }, []);
-
-  const fetchOdds = useCallback(
-    async (sport: SportKey, silent = false) => {
-      if (!silent) setLoading(true);
-      try {
-        const res = await fetch(`/api/odds?sport=${sport}`);
-        const data = await res.json();
-
-        if (!res.ok) {
-          if (!silent) {
-            addToast({
-              type: 'error',
-              title: 'Failed to load odds',
-              message: data.error || 'Please check your API key configuration.',
-            });
-          }
-          return;
-        }
-
-        const games: ProcessedGame[] = data.games || [];
-        setGamesCache((prev) => ({ ...prev, [sport]: games }));
-        setRemainingRequests(data.remainingRequests ?? null);
-        setLastUpdated(new Date());
-        setNextRefresh(REFRESH_INTERVAL);
-
-        const highEVBets = games.flatMap((g) => {
-          const bets: { game: ProcessedGame; side: 'home' | 'away'; ev: number }[] = [];
-          if (g.ev.away >= 0.03) bets.push({ game: g, side: 'away', ev: g.ev.away });
-          if (g.ev.home >= 0.03) bets.push({ game: g, side: 'home', ev: g.ev.home });
-          return bets;
-        });
-
-        for (const bet of highEVBets) {
-          const key = `${bet.game.id}-${bet.side}`;
-          if (!alertSent.has(key)) {
-            const team = bet.side === 'home' ? bet.game.home_team : bet.game.away_team;
-            const oddsData = bet.side === 'home' ? bet.game.bestOdds.home : bet.game.bestOdds.away;
-            if (oddsData) {
-              setAlertSent((prev) => { const s = new Set(Array.from(prev)); s.add(key); return s; });
-              const payload: AlertPayload = {
-                game: `${bet.game.away_team} @ ${bet.game.home_team}`,
-                team,
-                odds: oddsData.odds,
-                ev: bet.ev,
-                bookmaker: oddsData.bookmaker,
-                sport: bet.game.sport_title,
-              };
-              fetch('/api/send-best-bet-alert', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-              }).catch(() => {});
-            }
-          }
-        }
-      } catch {
-        if (!silent) {
-          addToast({
-            type: 'error',
-            title: 'Connection error',
-            message: 'Unable to fetch odds data. Check your network.',
-          });
-        }
-      } finally {
-        setLoading(false);
-      }
-    },
-    [addToast, alertSent]
-  );
-
-  useEffect(() => {
-    fetchOdds(activeSport);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSport]);
-
-  useEffect(() => {
-    if (intervalRef.current) clearInterval(intervalRef.current);
-    if (countdownRef.current) clearInterval(countdownRef.current);
-
-    intervalRef.current = setInterval(() => {
-      fetchOdds(activeSport, true);
-    }, REFRESH_INTERVAL * 1000);
-
-    countdownRef.current = setInterval(() => {
-      setNextRefresh((prev) => (prev <= 1 ? REFRESH_INTERVAL : prev - 1));
-    }, 1000);
-
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-      if (countdownRef.current) clearInterval(countdownRef.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSport]);
-
-  const handleManualRefresh = useCallback(() => {
-    fetchOdds(activeSport);
-  }, [activeSport, fetchOdds]);
-
-  const handleSendAlert = useCallback(
-    async (game: ProcessedGame, side: 'home' | 'away') => {
-      const team = side === 'home' ? game.home_team : game.away_team;
-      const oddsData = side === 'home' ? game.bestOdds.home : game.bestOdds.away;
-      const ev = side === 'home' ? game.ev.home : game.ev.away;
-      if (!oddsData) return;
-
-      const payload: AlertPayload = {
-        game: `${game.away_team} @ ${game.home_team}`,
-        team,
-        odds: oddsData.odds,
-        ev,
-        bookmaker: oddsData.bookmaker,
-        sport: game.sport_title,
-      };
-
-      try {
-        const res = await fetch('/api/send-best-bet-alert', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-        if (res.ok) {
-          addToast({ type: 'success', title: 'Alert sent!', message: `SMS alert sent for ${team}` });
-        } else {
-          const data = await res.json();
-          addToast({ type: 'error', title: 'Alert failed', message: data.error || 'Could not send SMS.' });
-        }
-      } catch {
-        addToast({ type: 'error', title: 'Alert failed', message: 'Network error.' });
-      }
-    },
-    [addToast]
-  );
-
-  const gameCounts = Object.fromEntries(
-    Object.entries(gamesCache).map(([k, v]) => [k, v?.length ?? 0])
-  ) as Partial<Record<SportKey, number>>;
-
-  const rawGames = gamesCache[activeSport] || [];
-
-  let filteredGames = rawGames.filter((g) => {
-    const q = search.toLowerCase();
-    if (q && !g.home_team.toLowerCase().includes(q) && !g.away_team.toLowerCase().includes(q))
-      return false;
-    if (showHighEVOnly && g.ev.home < 0.03 && g.ev.away < 0.03)
-      return false;
-    return true;
-  });
-
-  const recOrder = ['MAX BET', 'STRONG +EV', 'LEAN', 'PASS', 'FADE'];
-
-  if (sortBy === 'ev') {
-    filteredGames = [...filteredGames].sort(
-      (a, b) => Math.max(b.ev.home, b.ev.away) - Math.max(a.ev.home, a.ev.away)
-    );
-  } else if (sortBy === 'time') {
-    filteredGames = [...filteredGames].sort(
-      (a, b) => new Date(a.commence_time).getTime() - new Date(b.commence_time).getTime()
-    );
-  } else if (sortBy === 'recommendation') {
-    filteredGames = [...filteredGames].sort((a, b) => {
-      const aRec = Math.min(recOrder.indexOf(a.recommendation.home), recOrder.indexOf(a.recommendation.away));
-      const bRec = Math.min(recOrder.indexOf(b.recommendation.home), recOrder.indexOf(b.recommendation.away));
-      return aRec - bRec;
-    });
-  }
-
-  return (
-    <div className="min-h-screen bg-slate-950 text-slate-100">
-      <Header
-        lastUpdated={lastUpdated}
-        nextRefresh={nextRefresh}
-        isLoading={loading}
-        onRefresh={handleManualRefresh}
-        remainingRequests={remainingRequests}
-      />
-
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
-        <SportsTabs
-          activeSport={activeSport}
-          onSportChange={(sport) => {
-            setActiveSport(sport);
-            setSearch('');
-          }}
-          gameCounts={gameCounts}
-        />
-
-        {rawGames.length > 0 && <StatsBar games={rawGames} />}
-
-        <div className="flex flex-col sm:flex-row gap-3">
-          <div className="relative flex-1">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500 pointer-events-none" />
-            <input
-              type="text"
-              placeholder="Search teams..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="w-full pl-9 pr-4 py-2 bg-slate-900 border border-slate-800 rounded-lg text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-slate-600 transition-colors"
-            />
-          </div>
-
-          <div className="flex items-center gap-2 shrink-0">
-            <SlidersHorizontal className="w-4 h-4 text-slate-500" />
-            <select
-              value={sortBy}
-              onChange={(e) => setSortBy(e.target.value as SortOption)}
-              className="bg-slate-900 border border-slate-800 rounded-lg text-sm text-slate-300 px-3 py-2 focus:outline-none focus:border-slate-600 transition-colors cursor-pointer"
-            >
-              <option value="ev">Sort: Best EV</option>
-              <option value="time">Sort: Game Time</option>
-              <option value="recommendation">Sort: Recommendation</option>
-            </select>
-
-            <button
-              onClick={() => setShowHighEVOnly(!showHighEVOnly)}
-              className={`flex items-center gap-1.5 px-3 py-2 rounded-lg border text-sm font-medium transition-all whitespace-nowrap ${
-                showHighEVOnly
-                  ? 'bg-emerald-600/20 border-emerald-600/40 text-emerald-400'
-                  : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              +EV Only
-            </button>
-          </div>
-        </div>
-
-        {loading && rawGames.length === 0 ? (
-          <EmptyState sport={activeSport} loading />
-        ) : filteredGames.length === 0 ? (
-          <EmptyState sport={activeSport} loading={false} />
-        ) : (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            {filteredGames.map((game) => (
-              <MatchupCard key={game.id} game={game} onAlert={handleSendAlert} />
-            ))}
-          </div>
-        )}
-      </main>
-
-      <AlertToast toasts={toasts} onDismiss={dismissToast} />
-    </div>
-  );
-}
